@@ -21,7 +21,7 @@ open outputs/SayType.app
 SIGN_IDENTITY='你的代码签名证书名称或 SHA-1' ./scripts/build.sh
 ```
 
-构建脚本不会完成 Apple 公证，也不会修改系统权限。
+构建脚本不会完成 Apple 公证，也不会修改系统权限。对外发布时使用下方的正式签名与公证流程。
 
 ## 离线回归测试
 
@@ -83,6 +83,52 @@ outputs/SayType.app/Contents/MacOS/SayType --selftest --text '嗯，明天下午
 
 它会重新构建，输出 `outputs/releases/SayType-<版本>-macOS-arm64.zip` 和 `SHA256SUMS`。压缩包只包含 App，不包含本地配置、用户历史或日志。所有生成文件都被 Git 忽略。
 
+## 正式签名与 Apple 公证
+
+发布者需要有效的 Developer ID Application 证书及其私钥。先把公证凭证存入本机钥匙串；交互提示中输入 Apple 提供的 App 专用密码，不要把密码写进命令、脚本或仓库：
+
+```bash
+xcrun notarytool store-credentials saytype-notary \
+  --apple-id '你的 Apple 账号' --team-id '你的 Team ID'
+```
+
+正式构建会启用 Hardened Runtime、可信时间戳和麦克风权限。证书由发布者显式指定，普通开发构建仍使用临时签名。
+
+```bash
+RELEASE_SIGNING=1 SIGN_IDENTITY='你的 Developer ID Application 证书名称或 SHA-1' \
+  ./scripts/package.sh
+
+# 解压到本机缓存目录，避免同步文件夹重新附加 Finder 元数据。
+mkdir -p "$HOME/Library/Caches/SayType"
+notary_stage="$(mktemp -d "$HOME/Library/Caches/SayType/notarize.XXXXXX")"
+version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' app/Info.plist)"
+archive="SayType-$version-macOS-arm64.zip"
+ditto -x -k "outputs/releases/$archive" "$notary_stage"
+codesign --verify --strict --verbose=2 "$notary_stage/SayType.app"
+
+xcrun notarytool submit "outputs/releases/$archive" \
+  --keychain-profile saytype-notary --wait
+```
+
+必须等返回 `Accepted`，并用返回的提交 ID 下载、查看公证日志。如果等待超时，使用同一 ID 查询状态，不需要重新提交。通过后，将公证票据附到同一个 App，再重新压缩：
+
+```bash
+xcrun notarytool log '提交 ID' --keychain-profile saytype-notary \
+  outputs/notarization-log.json
+xcrun stapler staple "$notary_stage/SayType.app"
+xcrun stapler validate "$notary_stage/SayType.app"
+codesign --verify --strict --verbose=2 "$notary_stage/SayType.app"
+spctl --assess --type execute --verbose=4 "$notary_stage/SayType.app"
+
+ditto -c -k --keepParent --norsrc --noextattr "$notary_stage/SayType.app" \
+  "outputs/releases/$archive"
+(cd outputs/releases && shasum -a 256 "$archive" > SHA256SUMS)
+```
+
+此时不要再次运行 `build.sh` 或 `package.sh`，它们会重新构建并替换已公证的 App。发布前再解压最终 ZIP，对解压出来的 App 重复签名、公证票据和 Gatekeeper 检查，确认结果为 `Notarized Developer ID`。
+
+参考：[Apple 公证流程](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow)。
+
 ## 后续改进
 
-当前比较需要补足的是跨应用插入测试、云端迟到替换的可靠性、长段文字整理、诊断退出码以及发布签名和公证。欢迎以可复现问题为起点提交 Issue 或 PR。
+当前比较需要补足的是跨应用插入测试、云端迟到替换的可靠性、长段文字整理和诊断退出码。欢迎以可复现问题为起点提交 Issue 或 PR。
