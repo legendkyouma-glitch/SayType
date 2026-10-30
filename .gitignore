@@ -1,0 +1,14 @@
+.DS_Store
+.work/
+outputs/
+build/
+local.config.json
+.env
+.env.*
+!.env.example
+.secrets/
+*.log
+*.jsonl
+*.p12
+*.pfx
+*.key
