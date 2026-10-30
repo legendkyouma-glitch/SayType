@@ -4,9 +4,13 @@ SayType 使用 Swift、SwiftUI、AppKit、Speech 和 AVFoundation，没有第三
 
 ## 构建与签名
 
+普通用户可直接使用 [已打包的 App](https://github.com/legendkyouma-glitch/SayType/releases)，下面的步骤仅供源码开发使用。
+
 Apple Silicon Mac、macOS 26+、Xcode 26+：
 
 ```bash
+git clone https://github.com/legendkyouma-glitch/SayType.git
+cd SayType
 ./scripts/build.sh
 open outputs/SayType.app
 ```

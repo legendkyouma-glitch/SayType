@@ -4,6 +4,8 @@ SayType 是一个 macOS 菜单栏语音输入工具。按住快捷键说中文�
 
 **Apple Silicon · macOS 26+ · 中文界面 · MIT 开源**
 
+**[直接下载 Mac 版，无需 Xcode](https://github.com/legendkyouma-glitch/SayType/releases/download/v0.1.0/SayType-0.1.0-macOS-arm64.zip)** · [版本说明](https://github.com/legendkyouma-glitch/SayType/releases/tag/v0.1.0)
+
 [下载安装](#安装) · [怎么用](#怎么用) · [数据去向](docs/privacy.md) · [常见问题](docs/troubleshooting.md) · [参与开发](CONTRIBUTING.md)
 
 ## 能做什么
@@ -21,24 +23,15 @@ SayType 是一个 macOS 菜单栏语音输入工具。按住快捷键说中文�
 
 ## 安装
 
-### 下载 App
+普通用户直接下载 App 就能使用，**不需要 Xcode、下载源码或运行终端命令**。本机识别也不需要 API Key。
 
-从 [Releases](https://github.com/legendkyouma-glitch/SayType/releases) 下载 `SayType-0.1.0-macOS-arm64.zip`，解压后把 `SayType.app` 放到“应用程序”文件夹，再打开。
+1. [下载 SayType-0.1.0-macOS-arm64.zip](https://github.com/legendkyouma-glitch/SayType/releases/download/v0.1.0/SayType-0.1.0-macOS-arm64.zip)，双击解压。
+2. 把 `SayType.app` 拖进“应用程序”文件夹，再双击打开。
+3. 按首次引导授予麦克风和辅助功能权限，选好快捷键后试说一句。
 
 当前发布包使用临时签名，尚未经过 Apple 公证。如果 macOS 阻止打开，请先确认下载来源，再按系统提示在“系统设置 → 隐私与安全性”中处理。具体说明见 [Apple 官方帮助](https://support.apple.com/zh-cn/102445)。
 
-### 从源码构建
-
-需要完整的 **Xcode 26 或更新版本**，以及它提供的 macOS SDK。没有第三方依赖需要安装。
-
-```bash
-git clone https://github.com/legendkyouma-glitch/SayType.git
-cd SayType
-./scripts/build.sh
-open outputs/SayType.app
-```
-
-脚本默认使用临时签名，不需要开发者账号。重新构建或更新后，系统可能要求重新授予权限。需要使用自己的签名证书时，见 [开发说明](CONTRIBUTING.md#构建与签名)。
+需要修改代码或自己编译时，再看 [开发说明](CONTRIBUTING.md#构建与签名)。
 
 ## 第一次试用
 
