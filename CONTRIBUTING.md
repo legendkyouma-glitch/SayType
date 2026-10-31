@@ -2,6 +2,12 @@
 
 SayType 使用 Swift、SwiftUI、AppKit、Speech 和 AVFoundation，没有第三方运行时依赖。产品功能与使用方式见 [README](README.md)。
 
+## 提交改动
+
+请从自己的分支或 Fork 发起 Pull Request（PR），说明解决了什么问题、如何验证。涉及界面的改动请附截图；较大的功能建议先开 Issue 讨论。
+
+`main` 的改动通过 PR 合并，由维护者 `@legendkyouma-glitch` review。PR 更新代码后需要重新批准，合并前请解决 review 中的讨论。提交前运行与改动相关的检查，并在 PR 中写明结果；纯文档改动不需要编译应用。
+
 ## 构建与签名
 
 普通用户可直接使用 [已打包的 App](https://github.com/legendkyouma-glitch/SayType/releases)，下面的步骤仅供源码开发使用。
