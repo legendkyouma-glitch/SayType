@@ -15,7 +15,9 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section {
-                Text(s.summary).font(.callout)
+                Text(s.summary).font(.callout).fixedSize(horizontal: false, vertical: true)
+                Text(currentRecognition).font(.callout).fixedSize(horizontal: false, vertical: true)
+                Text(currentCleanup).font(.callout).fixedSize(horizontal: false, vertical: true)
                 Text("修改后从下一句开始生效。").font(.caption).foregroundStyle(.secondary)
             } header: { Text("当前组合") }
 
@@ -29,18 +31,22 @@ struct SettingsView: View {
                 Text(dataFlow).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 if s.preset == .custom {
                     Picker("语音识别", selection: bind({ s.customASR }, { s.customASR = $0 })) {
-                        Text("本机（macOS 语音识别）").tag(ASREngine.local)
+                        Text("本机（\(s.localModelName)）").tag(ASREngine.local)
                         Text("云端（OpenRouter）").tag(ASREngine.cloud)
                     }
                     Picker("文字整理", selection: bind({ s.customCleanup }, { s.customCleanup = $0 })) {
                         Text("本机规则").tag(CleanupEngine.rules)
                         Text("云端大模型（OpenRouter）").tag(CleanupEngine.cloud)
                     }
-                    TextField("识别模型", text: bind({ s.sttModel }, { s.sttModel = $0 }))
-                    Text("同时请求备用模型 \(Cloud.backupSTTModel)，用先返回的结果。")
-                        .font(.caption).foregroundStyle(.secondary)
-                    TextField("整理模型", text: bind({ s.llmModel }, { s.llmModel = $0 }))
+                    TextField("云端识别模型", text: bind({ s.sttModel }, { s.sttModel = $0 }))
+                    Text("同时请求备用模型 \(ModelPresentation.displayName(backupSTTModel))，用先成功的结果。")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    TextField("云端整理模型", text: bind({ s.llmModel }, { s.llmModel = $0 }))
                 }
+            }
+
+            Section("本机识别模型") {
+                LocalModelSettingsView()
             }
 
             Section("OpenRouter Key") {
@@ -112,13 +118,34 @@ struct SettingsView: View {
     }
 
     private var dataFlow: String {
-        if s.asr == .local && s.cleanupEngine == .rules {
-            return "音频和文字都不离开这台 Mac：macOS 自带语音识别 + 本机整理规则。音频不保存，文字历史只存在本机。"
+        let cloudCleanup = s.cleanupEngine == .cloud && s.effectiveLevel != .raw
+        if s.asr == .local && !cloudCleanup {
+            let cleanup = s.effectiveLevel == .raw ? "本机文字规范化" : "本机整理规则"
+            return "音频和文字都不离开这台 Mac：\(s.localModelName) + \(cleanup)。音频不保存，文字历史只存在本机。"
         }
         var parts: [String] = []
         if s.asr == .cloud { parts.append("音频按停顿分段，同时发送到 OpenRouter 上的两个识别模型，采用先成功的结果") }
-        if s.cleanupEngine == .cloud { parts.append("识别文字、本次口述前文的末尾和当前应用名发送到 OpenRouter 上的大模型整理") }
-        return parts.joined(separator: "；") + "。音频不保存；文字历史只存在本机。网络不通时自动改用本机处理。"
+        else { parts.append("音频由 \(s.localModelName) 在本机识别") }
+        if cloudCleanup { parts.append("识别文字、本次口述前文的末尾和当前应用名发送到 OpenRouter 上的大模型整理") }
+        var fallbacks: [String] = []
+        if s.asr == .cloud { fallbacks.append("云端识别不可用时改用 \(s.localModelName)") }
+        if cloudCleanup { fallbacks.append("云端整理不可用时改用本机规则") }
+        return parts.joined(separator: "；") + "。音频不保存；文字历史只存在本机。" + fallbacks.joined(separator: "，") + "。"
+    }
+
+    private var backupSTTModel: String {
+        s.sttModel == Cloud.backupSTTModel ? "qwen/qwen3-asr-1.7b" : Cloud.backupSTTModel
+    }
+
+    private var currentRecognition: String {
+        if s.asr == .local { return "识别：\(s.localModelName)（本机）" }
+        return "识别：\(ModelPresentation.displayName(s.sttModel)) / \(ModelPresentation.displayName(backupSTTModel))（云端）；本机备用：\(s.localModelName)"
+    }
+
+    private var currentCleanup: String {
+        if s.effectiveLevel == .raw { return "整理：原样（本机文字规范化）" }
+        if s.cleanupEngine == .cloud { return "整理：\(ModelPresentation.displayName(s.llmModel))（云端）" }
+        return "整理：本机规则"
     }
 
     private var levelHint: String {
@@ -177,9 +204,6 @@ struct HistoryView: View {
                         HStack(spacing: 8) {
                             Text(HistoryView.df.string(from: it.date)).font(.caption).foregroundStyle(.secondary).monospacedDigit()
                             Text(it.app).font(.caption.weight(.medium))
-                            Text("\(it.asr) · \(it.cleanup)").font(.caption2)
-                                .padding(.horizontal, 6).padding(.vertical, 1)
-                                .background(Capsule().fill(Color.secondary.opacity(0.15)))
                             if it.status != "已填入" {
                                 Text(it.status).font(.caption2).foregroundStyle(.orange)
                             }
@@ -190,6 +214,9 @@ struct HistoryView: View {
                             }
                             .controlSize(.small)
                         }
+                        Text("识别：\(it.asr) · 整理：\(it.cleanup)").font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                         Text(it.text).font(.system(size: 13.5)).textSelection(.enabled)
                         if it.raw != it.text && !it.raw.isEmpty {
                             Text("原话：\(it.raw)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled)

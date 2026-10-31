@@ -7,7 +7,16 @@ import SwiftUI
 /// 一段识别的结果；pending 是还没回来的云端识别（本机结果先填入时）
 struct SegOut: Sendable {
     let text: String
+    let model: String
+    let cloud: Bool
+    var note: String? = nil
     let pending: Task<(text: String, model: String), Error>?
+}
+
+struct LocalSegmentResult: Sendable {
+    let text: String
+    let model: String
+    var note: String? = nil
 }
 
 /// 已经填进输入框的一段（含段间空格），用于云端结果晚到时核对和替换
@@ -17,37 +26,18 @@ struct InsertedPiece {
     var at: Double
 }
 
-enum WaitResult: Sendable { case ok(String), failed, late }
-
-/// 等一个云端任务最多 seconds 秒；超时不取消任务（它会继续跑，结果可以稍后用）
-func waitFor(_ t: Task<(text: String, model: String), Error>, seconds: Double) async -> WaitResult {
-    final class Once: @unchecked Sendable {
-        private let lock = NSLock()
-        private var done = false
-        func claim() -> Bool { lock.lock(); defer { lock.unlock() }; if done { return false }; done = true; return true }
-    }
-    let once = Once()
-    return await withCheckedContinuation { (c: CheckedContinuation<WaitResult, Never>) in
-        Task {
-            do {
-                let r = try await t.value
-                if once.claim() { c.resume(returning: .ok(r.text)) }
-            } catch {
-                if once.claim() { c.resume(returning: .failed) }
-            }
-        }
-        Task {
-            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-            if once.claim() { c.resume(returning: .late) }
-        }
-    }
-}
 
 final class Session: @unchecked Sendable {
     let id: Int
     let t0 = nowMs()
     let target: Inserter.Target
     let asr: ASREngine
+    let localModelID: String
+    let localModelName: String
+    let cloudASRModel: String
+    let cloudCleanupModel: String
+    let cloudBaseURL: String
+    let cjkSpacing: Bool
     let insertMode: InsertMode
     let level: CleanupLevel
     let cleanupEngine: CleanupEngine
@@ -76,11 +66,24 @@ final class Session: @unchecked Sendable {
     var cleanupUsed = Set<String>()
     var methods = Set<String>()
     var warnedCap = false
+    var localTasks: [Task<LocalSegmentResult, Never>] = []
+    var cloudTasks: [Task<(text: String, model: String), Error>] = []
+    var releasedLocalModel = false
+    var lastRecognition = ""
+    var lastCleanup = ""
+    var lastUpgradeTitle: String?
+    var historyID: UUID?
 
     init(id: Int, target: Inserter.Target, settings s: Settings, practice: Bool) {
         self.id = id
         self.target = target
         self.asr = s.asr
+        self.localModelID = s.localModelID
+        self.localModelName = s.localModelName
+        self.cloudASRModel = s.sttModel
+        self.cloudCleanupModel = s.llmModel
+        self.cloudBaseURL = s.baseURL
+        self.cjkSpacing = s.cjkSpacing
         self.level = s.effectiveLevel
         self.cleanupEngine = s.cleanupEngine
         self.insertMode = s.effectiveInsertMode
@@ -91,6 +94,8 @@ final class Session: @unchecked Sendable {
 
     func onAudio(_ buf: AVAudioPCMBuffer) {
         recorder.feed(buf)
+        // Other local models produce their own segment previews; never label Apple text as theirs.
+        guard localModelID == LocalModelCatalog.appleID else { return }
         lock.lock()
         if let l = local { lock.unlock(); l.feed(buf); return }
         // 本机识别还没准备好：先存起来，准备好后补喂，避免丢掉开头的字
@@ -126,6 +131,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var session: Session?
     private var finishing: Session?
     private var nextID = 1
+    private var lastCompletedSessionID: Int?
     /// 最近一次往其他应用填入文字的时间（用于判断“选中再粘贴”替换是否安全）
     private var lastInsertMs: Double = 0
     private var noticed = Set<String>()
@@ -197,6 +203,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let ok = hotkey.start()
         Log.shared.ev("hotkey_tap", ["ok": ok, "key": settings.hotkey.rawValue])
         if ok && announce {
+            hud.setModels(configuredModels())
             hud.flash(.info, "SayType 已就绪", hintIdle, tag: engineTag(), seconds: 3)
         }
     }
@@ -208,12 +215,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func engineTag(_ s: Session? = nil) -> String {
-        let asr = s?.asr ?? settings.asr
         let mode = s?.insertMode ?? settings.effectiveInsertMode
         let level = s?.level ?? settings.effectiveLevel
-        let a = asr == .cloud ? "云端" : "本机"
         let l: String = { switch level { case .raw: return "原样"; case .light: return "轻度整理"; case .polish: return "润色" } }()
-        return "\(a) · \(mode == .segment ? "逐段填入" : "一次填入") · \(l)"
+        return "\(mode == .segment ? "逐段填入" : "一次填入") · \(l)"
+    }
+
+    private func configuredModels(_ s: Session? = nil) -> String {
+        let asr = s?.asr ?? settings.asr
+        let local = s?.localModelName ?? settings.localModelName
+        let primary = s?.cloudASRModel ?? settings.sttModel
+        let backup = primary == Cloud.backupSTTModel ? "qwen/qwen3-asr-1.7b" : Cloud.backupSTTModel
+        let recognition = asr == .local
+            ? ModelPresentation.recognition(local, cloud: false)
+            : "\(ModelPresentation.displayName(primary)) / \(ModelPresentation.displayName(backup))（云端候选）"
+        let level = s?.level ?? settings.effectiveLevel
+        let cleanup = level == .raw ? "原样" : ModelPresentation.cleanup(
+            engine: (s?.cleanupEngine ?? settings.cleanupEngine) == .cloud ? "cloud" : "rules",
+            model: s?.cloudCleanupModel ?? settings.llmModel)
+        return "识别：\(recognition)\n整理：\(cleanup)"
+    }
+
+    private func isVisible(_ s: Session) -> Bool {
+        s.id == nextID - 1 && (session === s || (session == nil && finishing === s))
+    }
+
+    private func updateModelInfo(_ s: Session) {
+        guard s.id == nextID - 1 else { return }
+        guard session === s || (session == nil && finishing === s)
+                || (session == nil && finishing == nil && lastCompletedSessionID == s.id) else { return }
+        if s.lastRecognition.isEmpty {
+            hud.setModels(configuredModels(s))
+        } else {
+            hud.setModels("识别：\(s.lastRecognition)\n整理：\(s.lastCleanup.isEmpty ? "待处理" : s.lastCleanup)")
+        }
+    }
+
+    private func releaseLocalModel(_ s: Session) {
+        guard !s.releasedLocalModel else { return }
+        s.releasedLocalModel = true
+        let tasks = s.localTasks
+        Task { @MainActor in
+            for task in tasks { _ = await task.value }
+            LocalModelManager.shared.endSession(s.localModelID)
+        }
     }
 
     // MARK: 会话
@@ -247,7 +292,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let s = Session(id: nextID, target: target, settings: settings, practice: practice)
         nextID += 1
+        lastCompletedSessionID = nil
         session = s
+        LocalModelManager.shared.beginSession(s.localModelID)
         Log.shared.ev("session_start", ["id": s.id, "app": target.bundleID, "role": target.role,
                                          "hasElement": target.element != nil, "asr": s.asr.rawValue,
                                          "insertMode": s.insertMode.rawValue, "level": s.level.rawValue,
@@ -268,6 +315,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } catch {
             Log.shared.ev("mic_start_error", ["error": "\(error)"])
             session = nil
+            releaseLocalModel(s)
             hotkey.reset()
             hud.flash(.failed, "麦克风没有启动", "请检查输入设备：系统设置 → 声音 → 输入", seconds: 4)
             return
@@ -276,10 +324,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if practice { onboarding.resetPractice(); onboarding.listening = true }
         updateIcon()
         hud.model.elapsed = "0:00"
+        hud.setModels(configuredModels(s))
         hud.show(.listening, "正在听…", listeningHint(s), tag: engineTag(s))
         startTick(s)
 
-        // 本机流式识别：只给状态条做实时文字
+        // Apple preview is used only when Apple is the selected local model.
+        guard s.localModelID == LocalModelCatalog.appleID else { return }
         Task {
             do {
                 let l = try await LocalASRSession.make()
@@ -296,6 +346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     }
                 }
                 try await l.start()
+                guard !s.cancelled, self.session === s else { _ = await l.finish(); return }
                 s.attachLocal(l)
                 Log.shared.ev("local_ready", ["id": s.id, "ms": Int(nowMs() - s.t0)])
             } catch {
@@ -353,6 +404,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             s = f
         } else { return }
         s.cancelled = true
+        for task in s.localTasks { task.cancel() }
+        for task in s.cloudTasks { task.cancel() }
+        releaseLocalModel(s)
         s.recorder.discard()
         Task { _ = await s.localSession?.finish() }
         if finishing === s { finishing = nil }
@@ -381,6 +435,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if settings.soundEnabled { NSSound(named: "Pop")?.play() }
         if s.recordMode == .hold && !s.locked && reason == "hotkey" && dur < settings.minPressSeconds * 1000 {
             s.cancelled = true
+            releaseLocalModel(s)
             s.recorder.discard()
             Task { _ = await s.localSession?.finish() }
             Log.shared.ev("session_discard_short", ["id": s.id, "ms": Int(dur)])
@@ -394,7 +449,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if s.asr == .cloud || s.cleanupEngine == .cloud {
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
                 MainActor.assumeIsolated {
-                    guard let self, self.finishing === s, self.session == nil, !s.cancelled else { return }
+                    guard let self, self.isVisible(s), self.session == nil, !s.cancelled else { return }
                     self.hud.setDetail("云端响应有点慢，正在等待；按 Esc 可取消")
                 }
             }
@@ -416,7 +471,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: 段落流水线：识别可以并行，整理和填入按顺序
 
-    private func enqueue(_ s: Session, engine: String, produce: @escaping @Sendable () async -> SegOut) {
+    private func enqueue(_ s: Session, produce: @escaping @Sendable () async -> SegOut) {
         let idx = s.segments
         s.segments += 1
         let produceTask = Task { await produce() }
@@ -439,14 +494,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
             s.raws.append(trimmed)
-            s.asrUsed.insert(engine)
+            let recognition = ModelPresentation.recognition(out.model, cloud: out.cloud)
+            s.asrUsed.insert(recognition)
+            s.lastRecognition = recognition
+            self.updateModelInfo(s)
+            if let note = out.note, self.isVisible(s) {
+                self.hud.setDetail(note)
+            }
             if s.insertMode == .once { return } // 一次填入：结束后整段整理
             let c = await Cleaner.run(trimmed, context: s.inserted.joined(), level: s.level,
-                                      engine: s.cleanupEngine, app: s.target.appName)
-            s.cleanupUsed.insert(c.engine)
+                                      engine: s.cleanupEngine, app: s.target.appName,
+                                      model: s.cloudCleanupModel, baseURL: s.cloudBaseURL, cjkSpacing: s.cjkSpacing)
+            let cleanup = ModelPresentation.cleanup(engine: c.engine, model: c.model ?? "")
+            s.cleanupUsed.insert(cleanup)
+            s.lastCleanup = cleanup
+            self.updateModelInfo(s)
             Log.shared.ev("cleanup", ["id": s.id, "seg": idx, "engine": c.engine, "inChars": trimmed.count,
                                       "outChars": c.text.count, "ms": Int(c.ms), "note": c.note.map { String($0.prefix(160)) } ?? ""])
-            if let note = c.note, note.hasPrefix("cloud failed") {
+            if let note = c.note, note.hasPrefix("cloud failed"), !s.cancelled,
+               self.isVisible(s) {
                 self.noticeOnce("cleanup-fail", "云端整理暂时不可用，这次改用本机规则", "文字会更口语一些")
             }
             guard !s.cancelled else { return }
@@ -470,7 +536,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 云端和本机同时开始；云端 4 秒内回来就用云端，否则先用本机结果，云端回来后再覆盖
         let race = Task { () throws -> (text: String, model: String) in
             do {
-                let r = try await Cloud.transcribeRace(samples: samples)
+                let r = try await Cloud.transcribeRace(samples: samples, primaryModel: s.cloudASRModel, baseURL: s.cloudBaseURL)
                 Log.shared.ev("cloud_asr", ["id": s.id, "seg": idx, "audioSec": seconds, "ms": Int(nowMs() - t0),
                                             "chars": r.text.count, "model": r.model])
                 return r
@@ -480,25 +546,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 throw error
             }
         }
-        let local = Task { await LocalASRSession.transcribe(samples: samples) }
-        enqueue(s, engine: "云端识别") { [weak self] in
+        let local = makeLocalTask(samples, s)
+        s.cloudTasks.append(race)
+        enqueue(s) {
             switch await waitFor(race, seconds: AppDelegate.cloudPatience) {
-            case .ok(let text):
-                return SegOut(text: text, pending: nil)
+            case .ok(let text, let model):
+                return SegOut(text: text, model: model, cloud: true, pending: nil)
             case .failed:
-                await MainActor.run { [weak self] in
-                    s.asrUsed.insert("本机识别（云端失败）")
-                    self?.noticeOnce("asr-fail", "云端识别暂时不可用，这次改用本机识别", "准确度可能略低")
-                    self?.hud.setTag("本机")
-                }
-                return SegOut(text: await local.value, pending: nil)
+                let result = await local.value
+                return SegOut(text: result.text, model: result.model, cloud: false,
+                              note: "云端识别失败，已用 \(result.model) 识别", pending: nil)
             case .late:
                 Log.shared.ev("cloud_asr_late_local_first", ["id": s.id, "seg": idx, "audioSec": seconds])
-                await MainActor.run { [weak self] in
-                    s.asrUsed.insert("本机识别（云端较慢）")
-                    self?.noticeOnce("asr-slow", "云端有点慢，先填入本机结果", "逐段模式下，条件允许时会用云端结果更新")
+                let available = await firstAvailable(cloud: race, local: local, isUsableLocal: { result in
+                    let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return !text.isEmpty && (s.level == .raw || RulesCleaner.hasContent(text))
+                })
+                switch available {
+                case .cloud(let text, let model):
+                    return SegOut(text: text, model: model, cloud: true, pending: nil)
+                case .local(let result):
+                    return SegOut(text: result.text, model: result.model, cloud: false,
+                                  note: "先用 \(result.model) 出字，等待云端结果",
+                                  pending: s.insertMode == .segment ? race : nil)
                 }
-                return SegOut(text: await local.value, pending: s.insertMode == .segment ? race : nil)
             }
         }
     }
@@ -510,11 +581,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !s.cancelled else { return }
         let seconds = Double(samples.count) / SegmentRecorder.rate
         let t0 = nowMs()
-        enqueue(s, engine: "本机识别") {
-            let text = await LocalASRSession.transcribe(samples: samples)
-            Log.shared.ev("local_asr", ["id": s.id, "seg": idx, "audioSec": seconds, "ms": Int(nowMs() - t0), "chars": text.count])
-            return SegOut(text: text, pending: nil)
+        let local = makeLocalTask(samples, s)
+        enqueue(s) {
+            let result = await local.value
+            Log.shared.ev("local_asr", ["id": s.id, "seg": idx, "audioSec": seconds, "ms": Int(nowMs() - t0),
+                                        "chars": result.text.count, "model": result.model])
+            return SegOut(text: result.text, model: result.model, cloud: false, note: result.note, pending: nil)
         }
+    }
+
+    private func makeLocalTask(_ samples: [Float], _ s: Session) -> Task<LocalSegmentResult, Never> {
+        let id = s.localModelID
+        let name = s.localModelName
+        let task = Task { () -> LocalSegmentResult in
+            guard !Task.isCancelled else { return LocalSegmentResult(text: "", model: name) }
+            if id == LocalModelCatalog.appleID {
+                return LocalSegmentResult(text: await LocalASRSession.transcribe(samples: samples), model: ModelPresentation.appleName)
+            }
+            do {
+                let text = try await LocalModelRuntime.shared.transcribe(samples: samples, modelID: id)
+                guard !Task.isCancelled else { return LocalSegmentResult(text: "", model: name) }
+                return LocalSegmentResult(text: text, model: name)
+            } catch {
+                guard !Task.isCancelled else { return LocalSegmentResult(text: "", model: name) }
+                Log.shared.ev("local_model_fallback", ["model": id])
+                return LocalSegmentResult(text: await LocalASRSession.transcribe(samples: samples),
+                                          model: ModelPresentation.appleName,
+                                          note: "\(name) 暂时不可用，已改用 Apple 语音识别")
+            }
+        }
+        s.localTasks.append(task)
+        return task
     }
 
     /// 云端结果晚到：整理后替换掉先填入的本机文字。只有能核对原文时才替换，否则保留本机结果。
@@ -524,7 +621,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let trimmed = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard RulesCleaner.hasContent(trimmed), i < s.pieces.count else { return }
             let c = await Cleaner.run(trimmed, context: s.inserted.prefix(i).joined(), level: s.level,
-                                      engine: s.cleanupEngine, app: s.target.appName)
+                                      engine: s.cleanupEngine, app: s.target.appName,
+                                      model: s.cloudCleanupModel, baseURL: s.cloudBaseURL, cjkSpacing: s.cjkSpacing)
             guard !s.cancelled, RulesCleaner.hasContent(c.text), i < s.pieces.count else { return }
             let p = s.pieces[i]
             let newPiece = self.joinPiece(previous: i > 0 ? s.inserted[i - 1] : nil, next: c.text)
@@ -540,10 +638,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else if !s.focusLost && self.inserter.focusStillOn(s.target) {
                 if self.inserter.replaceAX(old: p.text, new: newPiece, suffixAfter: suffix, in: s.target) {
                     ok = true; how = "ax"
-                } else if suffix.isEmpty && p.method == "paste" && self.lastInsertMs == p.at
-                            && self.hotkey.lastUserInputMs < p.at {
-                    ok = self.inserter.replaceLastViaPaste(old: p.text, new: newPiece, in: s.target)
-                    how = ok ? "select+paste" : "none"
                 }
             }
             Log.shared.ev("cloud_upgrade", ["id": s.id, "seg": seg, "ok": ok, "how": how, "model": r.model,
@@ -553,9 +647,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             s.pieces[i].at = nowMs()
             if self.lastInsertMs == p.at { self.lastInsertMs = s.pieces[i].at }
             s.inserted[i] = c.text
-            s.asrUsed.insert("云端识别（覆盖本机）")
-            if self.session == nil && self.finishing == nil {
-                self.hud.flash(.done, "已用云端结果更新", String(c.text.suffix(60)), tag: self.engineTag(s), seconds: 1.4)
+            s.lastRecognition = ModelPresentation.recognition(r.model, cloud: true)
+            s.lastCleanup = ModelPresentation.cleanup(engine: c.engine, model: c.model ?? "")
+            s.asrUsed.insert(s.lastRecognition)
+            s.cleanupUsed.insert(s.lastCleanup)
+            s.lastUpgradeTitle = ModelPresentation.upgradeTitle(recognitionModel: r.model, cleanupModel: c.model)
+            self.updateModelInfo(s)
+            if let historyID = s.historyID {
+                self.history.update(id: historyID, text: self.fullText(s),
+                                    asr: s.asrUsed.sorted().joined(separator: " + "), cleanup: self.cleanupName(s))
+            }
+            if self.isVisible(s) {
+                self.hud.model.title = s.lastUpgradeTitle!
+            } else if self.session == nil && self.finishing == nil && self.lastCompletedSessionID == s.id
+                        && s.id == self.nextID - 1 {
+                self.hud.flash(.done, s.lastUpgradeTitle!, String(c.text.suffix(60)), tag: self.engineTag(s), seconds: 3)
             }
         }
     }
@@ -601,11 +707,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 一次填入：整段整理后插入
         if s.insertMode == .once && !s.raws.isEmpty {
             let raw = s.raws.reduce("") { $0 + joinPiece(previous: $0.isEmpty ? nil : $0, next: $1) }
-            let c = await Cleaner.run(raw, context: "", level: s.level, engine: s.cleanupEngine, app: s.target.appName)
-            s.cleanupUsed.insert(c.engine)
+            let c = await Cleaner.run(raw, context: "", level: s.level, engine: s.cleanupEngine, app: s.target.appName,
+                                      model: s.cloudCleanupModel, baseURL: s.cloudBaseURL, cjkSpacing: s.cjkSpacing)
+            s.lastCleanup = ModelPresentation.cleanup(engine: c.engine, model: c.model ?? "")
+            s.cleanupUsed.insert(s.lastCleanup)
+            updateModelInfo(s)
             Log.shared.ev("cleanup", ["id": s.id, "seg": -1, "engine": c.engine, "inChars": raw.count,
                                       "outChars": c.text.count, "ms": Int(c.ms), "note": c.note.map { String($0.prefix(160)) } ?? ""])
-            if let note = c.note, note.hasPrefix("cloud failed") {
+            if let note = c.note, note.hasPrefix("cloud failed"), !s.cancelled,
+               isVisible(s) {
                 noticeOnce("cleanup-fail", "云端整理暂时不可用，这次改用本机规则", "文字会更口语一些")
             }
             guard !s.cancelled else { return }
@@ -640,13 +750,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                        "methods": Array(s.methods).sorted(), "speech": s.recorder.speechSeen,
                                        "releaseToEndMs": s.stopMs.map { Int(nowMs() - $0) } ?? -1])
         s.recorder.discard()
+        releaseLocalModel(s)
         if finishing === s { finishing = nil }
+        if s.id == nextID - 1 { lastCompletedSessionID = s.id }
 
         if !fullText.isEmpty {
-            history.add(HistoryItem(date: Date(), app: s.practice ? "SayType 练习" : s.target.appName,
+            let entry = HistoryItem(date: Date(), app: s.practice ? "SayType 练习" : s.target.appName,
                                     raw: rawText, text: fullText,
-                                    asr: s.asrUsed.sorted().joined(separator: "+"),
-                                    cleanup: cleanupName(s), status: status))
+                                    asr: s.asrUsed.sorted().joined(separator: " + "),
+                                    cleanup: cleanupName(s), status: status)
+            s.historyID = entry.id
+            history.add(entry)
         }
         if s.practice {
             if fullText.isEmpty {
@@ -657,7 +771,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        guard session == nil else { return } // 已经开始了下一句
+        guard session == nil, s.id == nextID - 1 else { return } // 不覆盖更新的口述或取消状态
+        updateModelInfo(s)
         if fullText.isEmpty {
             hud.flash(.failed, s.recorder.speechSeen ? "没有听清" : "没有听到声音",
                       s.recorder.speechSeen ? "可以再说一次" : "请检查麦克风或输入设备，或者说话声音再大一点", seconds: 2.5)
@@ -666,16 +781,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                       s.focusLost ? "输入框已切换，按 Cmd+V 粘贴到需要的位置" : "这里没能直接填入，按 Cmd+V 粘贴；也可以在历史里找到",
                       seconds: 3.5)
         } else {
-            hud.flash(.done, "已填入", String(fullText.suffix(60)), tag: engineTag(s), seconds: 1.4)
+            hud.flash(.done, s.lastUpgradeTitle ?? "已填入", String(fullText.suffix(60)), tag: engineTag(s), seconds: 3)
         }
     }
 
     private func cleanupName(_ s: Session) -> String {
         if s.level == .raw { return "原样" }
-        let parts = s.cleanupUsed.sorted().map { e -> String in
-            switch e { case "cloud": return s.level == .polish ? "云端润色" : "云端整理"; case "rules": return "规则整理"; default: return e }
-        }
-        return parts.isEmpty ? "规则整理" : parts.joined(separator: "+")
+        return s.cleanupUsed.isEmpty ? "未整理" : s.cleanupUsed.sorted().joined(separator: " + ")
+    }
+
+    private func fullText(_ s: Session) -> String {
+        (s.inserted + s.held).reduce("") { $0 + joinPiece(previous: $0.isEmpty ? nil : $0, next: $1) }
     }
 
     /// 段与段之间：英文/数字相邻时补一个空格，中文直接相连
@@ -690,7 +806,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !noticed.contains(key) else { return }
         noticed.insert(key)
         Log.shared.ev("notice", ["key": key])
-        hud.flash(.info, title, detail, tag: "本机", seconds: 3)
+        if session != nil || finishing != nil {
+            hud.model.title = title
+            hud.setDetail(detail)
+        } else {
+            hud.flash(.info, title, detail, seconds: 3)
+        }
     }
 
     private func updateIcon() {

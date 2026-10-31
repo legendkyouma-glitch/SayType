@@ -8,7 +8,9 @@ release_dir="$PWD/outputs/releases"
 mkdir -p "$release_dir"
 archive="SayType-$version-macOS-arm64.zip"
 rm -f "$release_dir/$archive"
-ditto -c -k --keepParent --norsrc --noextattr outputs/SayType.app "$release_dir/$archive"
+# build.sh archives and verifies outside synced folders, before a file provider
+# can attach Finder metadata to the .app. Keep those verified bytes unchanged.
+cp -X outputs/SayType.zip "$release_dir/$archive"
 cd "$release_dir"
 shasum -a 256 "$archive" > SHA256SUMS
 echo "Packaged: $release_dir/$archive"

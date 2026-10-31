@@ -18,9 +18,9 @@ enum CloudError: Error, CustomStringConvertible {
 }
 
 enum Cloud {
-    private static func request(path: String, body: [String: Any], timeout: TimeInterval) async throws -> [String: Any] {
+    private static func request(path: String, body: [String: Any], timeout: TimeInterval, baseURL: String? = nil) async throws -> [String: Any] {
         guard let key = KeyStore.key else { throw CloudError.noKey }
-        guard let url = URL(string: Settings.shared.baseURL + path) else { throw CloudError.invalidRequest }
+        guard let url = URL(string: (baseURL ?? Settings.shared.baseURL) + path) else { throw CloudError.invalidRequest }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = timeout
@@ -80,27 +80,28 @@ enum Cloud {
     static let backupSTTModel = "openai/gpt-4o-mini-transcribe"
 
     /// 云端识别：一段音频整段上传，返回文字
-    static func transcribe(samples: [Float], model: String, timeout: TimeInterval) async throws -> String {
+    static func transcribe(samples: [Float], model: String, timeout: TimeInterval, baseURL: String? = nil) async throws -> String {
         let wav = WAV.encode(samples)
         let body: [String: Any] = [
             "model": model,
             "language": "zh",
             "input_audio": ["data": wav.base64EncodedString(), "format": "wav"],
         ]
-        let obj = try await request(path: "/audio/transcriptions", body: body, timeout: timeout)
+        let obj = try await request(path: "/audio/transcriptions", body: body, timeout: timeout, baseURL: baseURL)
         return try transcriptionText(from: obj)
     }
 
     /// 同时请求主模型和备用模型，用先成功返回的结果；截止时间 min(20, 8 + 音频秒数 × 0.5)。
     /// 两个都失败或超时才抛错（调用方改用本机识别）。
-    static func transcribeRace(samples: [Float]) async throws -> (text: String, model: String) {
-        let primary = Settings.shared.sttModel
+    static func transcribeRace(samples: [Float], primaryModel: String? = nil, baseURL: String? = nil) async throws -> (text: String, model: String) {
+        let primary = primaryModel ?? Settings.shared.sttModel
+        let endpoint = baseURL ?? Settings.shared.baseURL
         let backup = primary == backupSTTModel ? "qwen/qwen3-asr-1.7b" : backupSTTModel
         let sec = Double(samples.count) / SegmentRecorder.rate
         let timeout = min(20, 8 + sec * 0.5)
         return try await withThrowingTaskGroup(of: (String, String).self) { g in
-            g.addTask { (try await transcribe(samples: samples, model: primary, timeout: timeout), primary) }
-            g.addTask { (try await transcribe(samples: samples, model: backup, timeout: timeout), backup) }
+            g.addTask { (try await transcribe(samples: samples, model: primary, timeout: timeout, baseURL: endpoint), primary) }
+            g.addTask { (try await transcribe(samples: samples, model: backup, timeout: timeout, baseURL: endpoint), backup) }
             // 总截止时间（URLRequest 的 timeoutInterval 只管空闲时长，不管总时长）
             g.addTask {
                 try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
@@ -144,7 +145,7 @@ enum Cloud {
     """ + common
 
     /// 云端整理。context 是本次已经填入的前文，只作参考
-    static func cleanup(_ text: String, context: String, level: CleanupLevel, app: String, model: String? = nil) async throws -> String {
+    static func cleanup(_ text: String, context: String, level: CleanupLevel, app: String, model: String? = nil, baseURL: String? = nil) async throws -> String {
         var user = ""
         if !context.isEmpty { user += "【前文，仅供参考，不要输出】\n\(context.suffix(300))\n\n" }
         if !app.isEmpty { user += "【当前应用】\(app)\n\n" }
@@ -159,7 +160,7 @@ enum Cloud {
                 ["role": "user", "content": user],
             ],
         ]
-        let obj = try await request(path: "/chat/completions", body: body, timeout: level == .polish ? 12 : 6)
+        let obj = try await request(path: "/chat/completions", body: body, timeout: level == .polish ? 12 : 6, baseURL: baseURL)
         return try completionText(from: obj)
     }
 }
@@ -227,16 +228,16 @@ enum RulesCleaner {
 
 /// 整理入口：按力度和引擎选云端或规则，云端失败自动退回规则
 enum Cleaner {
-    struct Result { let text: String; let engine: String; let ms: Double; let note: String? }
+    struct Result { let text: String; let engine: String; let ms: Double; let note: String?; var model: String? = nil }
 
     static func run(_ raw: String, context: String, level: CleanupLevel, engine: CleanupEngine, app: String,
-                    cloudCleanup: @Sendable (String, String, CleanupLevel, String) async throws -> String = {
-                        try await Cloud.cleanup($0, context: $1, level: $2, app: $3)
-                    }) async -> Result {
+                    model: String? = nil, baseURL: String? = nil, cjkSpacing: Bool? = nil,
+                    cloudCleanup: (@Sendable (String, String, CleanupLevel, String) async throws -> String)? = nil) async -> Result {
         let t0 = nowMs()
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return Result(text: "", engine: "none", ms: 0, note: nil) }
-        let spacing = Settings.shared.cjkSpacing
+        let spacing = cjkSpacing ?? Settings.shared.cjkSpacing
+        let requestedModel = model ?? Settings.shared.llmModel
         func finish(_ s: String) -> String {
             var out = RulesCleaner.voiceCommands(RulesCleaner.simplified(s))
             if spacing { out = RulesCleaner.cjkSpacing(out) }
@@ -250,13 +251,19 @@ enum Cleaner {
                 return Result(text: finish(RulesCleaner.clean(trimmed)), engine: "rules", ms: nowMs() - t0, note: nil)
             }
             do {
-                let out = try await cloudCleanup(trimmed, context, level, app)
+                let out: String
+                if let cloudCleanup {
+                    out = try await cloudCleanup(trimmed, context, level, app)
+                } else {
+                    out = try await Cloud.cleanup(trimmed, context: context, level: level, app: app,
+                                                  model: requestedModel, baseURL: baseURL)
+                }
                 // 防越界：输出明显比输入长，多半是在回答或扩写，改用规则结果
                 let limit = level == .polish ? Int(Double(trimmed.count) * 2.0) + 40 : Int(Double(trimmed.count) * 1.6) + 20
                 if out.isEmpty || out.count > limit {
                     return Result(text: finish(RulesCleaner.clean(trimmed)), engine: "rules", ms: nowMs() - t0, note: "guard")
                 }
-                return Result(text: finish(out), engine: "cloud", ms: nowMs() - t0, note: nil)
+                return Result(text: finish(out), engine: "cloud", ms: nowMs() - t0, note: nil, model: requestedModel)
             } catch {
                 return Result(text: finish(RulesCleaner.clean(trimmed)), engine: "rules", ms: nowMs() - t0, note: "cloud failed: \(error)")
             }

@@ -1,6 +1,6 @@
 # 参与开发
 
-SayType 使用 Swift、SwiftUI、AppKit、Speech 和 AVFoundation，没有第三方运行时依赖。产品功能与使用方式见 [README](README.md)。
+SayType 使用 Swift、SwiftUI、AppKit、Speech 和 AVFoundation。可下载的本机模型通过原生 MLX Swift 运行，不依赖 Python。依赖版本由 `Package.swift` 和 `Package.resolved` 固定，许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。产品功能与使用方式见 [README](README.md)。
 
 ## 提交改动
 
@@ -12,7 +12,7 @@ SayType 使用 Swift、SwiftUI、AppKit、Speech 和 AVFoundation，没有第三
 
 普通用户可直接使用 [已打包的 App](https://github.com/legendkyouma-glitch/SayType/releases)，下面的步骤仅供源码开发使用。
 
-Apple Silicon Mac、macOS 26+、Xcode 26+：
+Apple Silicon Mac、macOS 26+，以及包含 Swift 6.4 或更新版本的 Xcode。还需在 Xcode → Settings → Components 安装 Metal Toolchain；这些只是开发环境要求，用户运行打包后的 App 不需要安装它们。
 
 ```bash
 git clone https://github.com/legendkyouma-glitch/SayType.git
@@ -27,6 +27,8 @@ open outputs/SayType.app
 SIGN_IDENTITY='你的代码签名证书名称或 SHA-1' ./scripts/build.sh
 ```
 
+构建同时生成 `outputs/SayType.zip`，并在临时目录解压检查签名。同步盘可能给 `.app` 重新附加 Finder 元数据，需要传递构建结果时使用这个 ZIP；`package.sh` 会直接复用它。
+
 构建脚本不会完成 Apple 公证，也不会修改系统权限。对外发布时使用下方的正式签名与公证流程。
 
 ## 离线回归测试
@@ -35,7 +37,7 @@ SIGN_IDENTITY='你的代码签名证书名称或 SHA-1' ./scripts/build.sh
 ./scripts/test.sh
 ```
 
-测试直接编译相关生产代码，隔离系统设置、钥匙串和用户数据，验证错误响应脱敏、截断结果处理、历史清理及配置文件路径。它不调用云端模型、不使用麦克风，也不代替桌面交互测试。
+测试直接编译相关生产代码，隔离系统设置、钥匙串和用户数据，验证错误响应脱敏、截断结果处理、真实模型归属、迟到结果的历史更新、模型文件校验及配置文件路径。它不调用云端模型、不使用麦克风，也不代替桌面交互或真实模型推理测试。
 
 改动录音、快捷键或插入逻辑后，请手动检查：
 
@@ -43,6 +45,8 @@ SIGN_IDENTITY='你的代码签名证书名称或 SHA-1' ./scripts/build.sh
 - 逐段/一次填入、焦点切换，以及目标应用中的手动粘贴回退。
 - 没有 Key、本机模式、云端失败和迟到结果替换。
 - 关闭历史保存、清空历史、重新启动和权限恢复。
+- 模型下载、取消、失败重试、删除，以及口述期间切换模型后下一句才生效。
+- 云端失败仍显示本机模型；迟到结果只有真正替换成功后才显示“已用 XX 模型优化”。
 
 不要使用私人文本做日志示例，也不要把个人 Key 或签名证书提交到仓库。
 
@@ -74,11 +78,13 @@ outputs/SayType.app/Contents/MacOS/SayType --selftest --text '嗯，明天下午
 | `app/Sources/AppDelegate.swift` | 录音会话、分段流水线、回退、菜单与窗口 |
 | `app/Sources/Audio.swift` | 音频采集、本机识别和语音分段 |
 | `app/Sources/Cloud.swift` | 云端请求、规则整理和云端失败回退 |
+| `app/Sources/LocalModels.swift`、`LocalModelStorage.swift` | 模型目录、下载校验、生命周期与本机 MLX 推理 |
+| `app/Sources/ModelPresentation.swift`、`TranscriptionResults.swift` | 实际模型名称、结果归属与超时等待 |
 | `app/Sources/Inserter.swift` | 辅助功能写入、粘贴和迟到结果替换 |
 | `app/Sources/Hotkey.swift` | 全局快捷键、锁定、取消 |
 | `app/Sources/Settings.swift` | 配置与 Key 存储 |
 | `app/Sources/History.swift` | 本机历史与音频自检 |
-| `app/Sources/Onboarding.swift`、`SettingsView.swift`、`HUD.swift` | 引导、设置、历史和状态条 |
+| `app/Sources/Onboarding.swift`、`SettingsView.swift`、`LocalModelSettingsView.swift`、`HUD.swift` | 引导、设置、模型下载、历史和状态条 |
 | `app/Sources/main.swift` | 启动入口、数据路径和日志 |
 
 ## 打包

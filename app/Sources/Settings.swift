@@ -40,6 +40,14 @@ final class Settings: ObservableObject, @unchecked Sendable {
         get { enumValue("customCleanup", CleanupEngine.rules) }
         set { store("customCleanup", newValue.rawValue) }
     }
+    /// 仅在模型下载、加载成功后切换；进行中的口述使用开始时的快照。
+    var localModelID: String {
+        get { d.string(forKey: "localModelID") ?? LocalModelCatalog.appleID }
+        set { store("localModelID", newValue) }
+    }
+    var localModelName: String {
+        LocalModelCatalog.model(id: localModelID)?.name ?? "本机识别模型"
+    }
 
     /// 实际使用的识别引擎：没有 Key 时一律本机
     var asr: ASREngine {

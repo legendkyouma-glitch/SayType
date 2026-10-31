@@ -121,7 +121,7 @@ struct OnboardingView: View {
                 ? "音频和文字会通过 OpenRouter 发送给云端模型识别和整理。"
                 : "音频和文字会通过 OpenRouter 发送给云端模型识别和整理，需要先在设置里填写 OpenRouter Key；填写之前按隐私优先处理。"
         }
-        return "使用 macOS 自带的语音识别和本机整理规则，音频和文字都不离开这台 Mac。以后可以随时在设置里切换。"
+        return "使用 \(s.localModelName) 和本机整理规则，音频和文字都不离开这台 Mac。以后可以在设置里下载和切换本机识别模型。"
     }
 
     // MARK: 2. 权限
