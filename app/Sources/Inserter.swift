@@ -170,8 +170,9 @@ final class Inserter {
             return false
         }
         restoreCaret(el, start + (new as NSString).length + (suffixAfter as NSString).length)
-        if let after = stringAttr(el, kAXValueAttribute) { return after.contains(new + suffixAfter) }
-        return true
+        let expected = ns.replacingCharacters(in: NSRange(location: start, length: (old as NSString).length), with: new)
+        guard let after = stringAttr(el, kAXValueAttribute) else { return false }
+        return after == expected
     }
 
     private func restoreCaret(_ el: AXUIElement, _ loc: Int) {

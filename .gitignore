@@ -1,5 +1,6 @@
 .DS_Store
 .work/
+.build/
 outputs/
 build/
 local.config.json
@@ -12,3 +13,4 @@ local.config.json
 *.p12
 *.pfx
 *.key
+*.safetensors

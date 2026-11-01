@@ -10,6 +10,7 @@ final class HUDModel: ObservableObject {
     @Published var title = ""
     @Published var detail = ""
     @Published var tag = ""
+    @Published var modelInfo = ""
     @Published var elapsed = ""
     @Published var levels: [CGFloat] = Array(repeating: 0.04, count: 32)
 
@@ -50,6 +51,13 @@ struct HUDView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                         .truncationMode(.head)
+                }
+                if !m.modelInfo.isEmpty {
+                    Text(m.modelInfo)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             if m.phase == .listening || m.phase == .locked {
@@ -117,6 +125,7 @@ final class HUD {
     private let panel: NSPanel
     private let host: NSHostingView<HUDView>
     private var generation = 0
+    private var titleSubscription: AnyCancellable?
 
     init() {
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 520, height: 70),
@@ -131,6 +140,11 @@ final class HUD {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         host = NSHostingView(rootView: HUDView(m: model))
         panel.contentView = host
+        // A late cloud replacement updates the title without calling show().
+        // Resize after SwiftUI sees that change, including titles that wrap.
+        titleSubscription = model.$title.removeDuplicates().dropFirst().sink { [weak self] _ in
+            DispatchQueue.main.async { self?.layout() }
+        }
     }
 
     func show(_ phase: HUDModel.Phase, _ title: String, _ detail: String = "", tag: String = "") {
@@ -151,8 +165,10 @@ final class HUD {
 
     func setDetail(_ d: String) { model.detail = d; layout() }
     func setTag(_ t: String) { model.tag = t }
+    func setModels(_ text: String) { model.modelInfo = text; layout() }
 
     private func layout() {
+        host.layoutSubtreeIfNeeded()
         let size = host.fittingSize
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main

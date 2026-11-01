@@ -51,6 +51,15 @@ final class HistoryStore: ObservableObject, @unchecked Sendable {
         Log.shared.ev("history_cleared")
     }
 
+    /// A late cloud replacement updates the existing entry without recreating cleared history.
+    func update(id: UUID, text: String, asr: String, cleanup: String) {
+        guard isEnabled(), let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].text = text
+        items[index].asr = asr
+        items[index].cleanup = cleanup
+        save()
+    }
+
     private func save() {
         let cutoff = now().addingTimeInterval(-Double(HistoryStore.keepDays) * 86400)
         items = Array(items.lazy.filter { $0.date > cutoff }.prefix(HistoryStore.maxItems))
